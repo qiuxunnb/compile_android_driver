@@ -1,0 +1,73 @@
+name: build-gpu-chams
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'code/**'
+      - 'kadeflow.yaml'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            clang lld llvm cpio rsync zip unzip git python3 curl wget
+
+      - name: 安装 lyenv
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/systemnb/lyenv/main/install.sh -o /tmp/lyenv.sh || \
+          wget -qO /tmp/lyenv.sh https://raw.githubusercontent.com/systemnb/lyenv/main/install.sh
+          bash /tmp/lyenv.sh || true
+          eval "$(lyenv activate)" || true
+
+      - name: 安装 kade 插件
+        run: |
+          eval "$(lyenv activate)" || true
+          lyenv plugin install kade 2>/dev/null || \
+          git clone --depth 1 https://github.com/systemnb/lyenv-plugin-center /tmp/plugins && \
+          cp -r /tmp/plugins/kade ~/.lyenv/plugins/ 2>/dev/null || true
+
+      - name: 准备配置
+        run: |
+          echo "=== 仓库结构 ==="
+          ls -la
+          echo "=== code 目录 ==="
+          ls -la code || true
+          echo "=== kadeflow.yaml ==="
+          cat kadeflow.yaml
+
+      - name: 编译
+        run: |
+          eval "$(lyenv activate)" || true
+          kade prepare || true
+          kade deps || true
+          kade sync || true
+          kade build
+          kade export || true
+
+      - name: 收集产物
+        if: always()
+        run: |
+          mkdir -p /tmp/out
+          find . -name '*.ko' -exec cp -v {} /tmp/out/ \; 2>/dev/null || true
+          ls -la /tmp/out || true
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu_chams-ko
+          path: /tmp/out/
+          if-no-files-found: warn
