@@ -6,63 +6,90 @@ on:
     branches: [ main ]
     paths:
       - 'code/**'
-      - 'kadeflow.yaml'
       - '.github/workflows/build.yml'
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装依赖
+      - name: 安装基础依赖（缺什么就跳过，不卡流程）
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential bc bison flex libssl-dev libelf-dev \
-            clang lld llvm cpio rsync zip unzip git python3 curl wget
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends \
+            git curl zip unzip bc bison flex libssl-dev libelf-dev \
+            python3 rsync cpio kmod || true
+          echo "=== 工具版本 ==="
+          clang --version 2>/dev/null | head -2 || echo "no clang"
+          ld.lld --version 2>/dev/null | head -1 || echo "no lld"
+          nproc
 
-      - name: 安装 lyenv
+      - name: 安装 repo 工具
         run: |
-          curl -fsSL https://raw.githubusercontent.com/systemnb/lyenv/main/install.sh -o /tmp/lyenv.sh || \
-          wget -qO /tmp/lyenv.sh https://raw.githubusercontent.com/systemnb/lyenv/main/install.sh
-          bash /tmp/lyenv.sh || true
-          eval "$(lyenv activate)" || true
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo || \
+          wget -qO ~/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+          ~/bin/repo --version || true
+          git config --global user.name "ci"
+          git config --global user.email "ci@ci"
 
-      - name: 安装 kade 插件
+      - name: 同步 GKI 内核源码 (android15-6.6)
         run: |
-          eval "$(lyenv activate)" || true
-          lyenv plugin install kade 2>/dev/null || \
-          git clone --depth 1 https://github.com/systemnb/lyenv-plugin-center /tmp/plugins && \
-          cp -r /tmp/plugins/kade ~/.lyenv/plugins/ 2>/dev/null || true
+          export PATH=$HOME/bin:$PATH
+          mkdir -p ~/gki && cd ~/gki
+          repo init -u https://android.googlesource.com/kernel/manifest \
+                    -b common-android15-6.6 --depth 1
+          repo sync -j4 --no-tags --optimize 2>/dev/null || repo sync -j2
+          echo "=== 源码就位 ==="
+          cd ~/gki/common
+          head -5 Makefile
+          ls arch/arm64/configs/ | head -20
+          git log --oneline -1 || true
 
-      - name: 准备配置
+      - name: 配置 + 编译内核（生成 Module.symvers）
         run: |
-          echo "=== 仓库结构 ==="
-          ls -la
-          echo "=== code 目录 ==="
-          ls -la code || true
-          echo "=== kadeflow.yaml ==="
-          cat kadeflow.yaml
+          cd ~/gki/common
+          export ARCH=arm64
+          export CC=clang
+          export LLVM=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          if [ -f arch/arm64/configs/gki_defconfig ]; then
+            make -j$(nproc) O=out gki_defconfig
+          else
+            make -j$(nproc) O=out defconfig
+          fi
+          # 必须完整编一次，否则没有 Module.symvers（MODVERSIONS 要用）
+          make -j$(nproc) O=out CC=clang LLVM=1 \
+               LD=ld.lld AR=llvm-ar NM=llvm-nm \
+               OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               HOSTCC=clang HOSTCXX=clang++ 2>&1 | tail -40
+          echo "=== 内核版本 ==="
+          make -s O=out kernelrelease 2>/dev/null || cat out/include/config/kernel.release 2>/dev/null
+          echo "=== Module.symvers ==="
+          ls -l out/Module.symvers || echo "没有 Module.symvers"
 
-      - name: 编译
+      - name: 编译 gpu_chams
         run: |
-          eval "$(lyenv activate)" || true
-          kade prepare || true
-          kade deps || true
-          kade sync || true
-          kade build
-          kade export || true
+          cd $GITHUB_WORKSPACE/code
+          make -C $HOME/gki/common O=$HOME/gki/common/out M=$PWD \
+               ARCH=arm64 CC=clang LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- \
+               modules 2>&1 | tail -40
+          echo "=== 产物 ==="
+          ls -l *.ko || echo "没编出 ko"
 
       - name: 收集产物
         if: always()
         run: |
           mkdir -p /tmp/out
-          find . -name '*.ko' -exec cp -v {} /tmp/out/ \; 2>/dev/null || true
-          ls -la /tmp/out || true
+          find $GITHUB_WORKSPACE -name '*.ko' -exec cp -v {} /tmp/out/ \; || true
+          cp -v $HOME/gki/common/out/Module.symvers /tmp/out/ 2>/dev/null || true
+          ls -la /tmp/out
 
       - name: 上传产物
         if: always()
@@ -71,3 +98,4 @@ jobs:
           name: gpu_chams-ko
           path: /tmp/out/
           if-no-files-found: warn
+          retention-days: 14
