@@ -27,20 +27,22 @@ jobs:
               [ -e "$c" ] && sudo ln -sf "$c" /usr/local/bin/ld.lld && break
             done
           fi
-          which ld.lld && ld.lld --version | head -1 || echo "no ld.lld"
-          which clang  && clang --version | head -2  || echo "no clang"
-          which pahole || echo "no pahole"
+          which ld.lld && ld.lld --version | head -1 || true
+          which clang  && clang --version | head -2  || true
 
-      - name: 打印仓库结构（诊断用）
+      - name: 定位源码并自动打补丁
         run: |
-          echo "=== 根目录 ==="
-          ls -la
-          echo "=== code 是什么 ==="
-          if [ -d code ]; then echo "code 是目录"; ls -la code;
-          elif [ -f code ]; then echo "code 是文件（要删掉）"; file code || true;
-          else echo "code 不存在（正常）"; fi
-          echo "=== 找源码 ==="
-          find . -maxdepth 2 -name 'gpu_chams.c' -not -path './.git/*'
+          F=$(find . -maxdepth 2 -name 'gpu_chams.c' -not -path './.git/*' | head -1)
+          if [ -z "$F" ]; then echo "!! 找不到 gpu_chams.c"; exit 1; fi
+          echo "源码: $F"
+          D=$(dirname "$F")
+          echo "SRC_DIR=$GITHUB_WORKSPACE/${D#./}" >> $GITHUB_ENV
+          ls -la "$D"
+          sed -i 's|#include <linux/ktime.h>|#include <linux/string.h>\n#include <linux/errno.h>|' "$F"
+          sed -i 's/probe_kernel_read/copy_from_kernel_nofault/g' "$F"
+          sed -i '/kgsl_mem_entry_placeholder/d' "$F"
+          echo "=== 补丁后检查 ==="
+          grep -n 'linux/string.h\|copy_from_kernel_nofault' "$F" || true
 
       - name: 安装 repo 工具
         run: |
@@ -52,14 +54,34 @@ jobs:
           git config --global user.name ci
           git config --global user.email ci@ci
 
-      - name: 同步 GKI 内核源码
+      - name: 同步 GKI 内核源码（浅克隆）
         run: |
           export PATH=$HOME/bin:$PATH
           mkdir -p ~/gki && cd ~/gki
           repo init -u https://android.googlesource.com/kernel/manifest \
                     -b common-android15-6.6 --depth 1
           repo sync -j4 --no-tags --optimize 2>/dev/null || repo sync -j2
-          cd ~/gki/common && head -5 Makefile
+          cd ~/gki/common && grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile
+
+      - name: 切到 6.6.89（浅拉单个 tag，最长 10 分钟）
+        run: |
+          cd ~/gki/common
+          echo "=== 当前版本 ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile
+          echo "=== 远端 6.6.89 tag（ls-remote，几秒出）==="
+          TAGS=$(timeout 180 git ls-remote --tags origin 2>/dev/null | grep -E '6\.6\.89' | awk '{print $2}' | sed 's|refs/tags/||' | grep -v '\^{}' | sort -V || true)
+          echo "$TAGS" | head -20
+          TAG=$(echo "$TAGS" | tail -1)
+          echo "选中 TAG=[$TAG]"
+          if [ -n "$TAG" ]; then
+            timeout 900 git fetch --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG" || \
+            timeout 900 git fetch --depth=1 origin tag "$TAG" || true
+            git checkout -f "$TAG" || true
+          else
+            echo "!! 没有 6.6.89 tag，保持当前版本（后面靠改 vermagic 兜底）"
+          fi
+          echo "=== 切换后版本 ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile
 
       - name: 生成 defconfig
         run: |
@@ -83,24 +105,24 @@ jobs:
                LD=ld.lld AR=llvm-ar NM=llvm-nm \
                OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ 2>&1 | tail -40
+          echo "=== 内核 release ==="
           make -s O=out kernelrelease 2>/dev/null || cat out/include/config/kernel.release
           ls -l out/Module.symvers || echo "没有 Module.symvers"
 
-      - name: 编译 gpu_chams（从根目录，不碰 code）
+      - name: 编译 gpu_chams
         run: |
-          SRC="$GITHUB_WORKSPACE"
-          if [ -f "$GITHUB_WORKSPACE/code/gpu_chams.c" ]; then
-            SRC="$GITHUB_WORKSPACE/code"
-          fi
-          echo "源码目录: $SRC"
-          ls -la "$SRC"
-          cd "$SRC"
+          echo "源码目录: $SRC_DIR"
+          cd "$SRC_DIR"
           export PATH=/usr/local/bin:$PATH
+          cat Makefile
           make -C $HOME/gki/common O=$HOME/gki/common/out M=$PWD \
                ARCH=arm64 CC=clang LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- \
-               modules 2>&1 | tail -40
+               KCFLAGS="-Wno-error" \
+               modules 2>&1 | tee /tmp/build.log | tail -60
           echo "=== 产物 ==="
-          ls -l *.ko || echo "没编出 ko"
+          ls -l *.ko 2>/dev/null || echo "!! 没编出 ko"
+          echo "=== 错误摘要 ==="
+          grep -iE 'error' /tmp/build.log | head -20 || true
 
       - name: 收集产物
         if: always()
@@ -109,6 +131,7 @@ jobs:
           find $GITHUB_WORKSPACE -name '*.ko' -not -path '*/.git/*' -exec cp -v {} /tmp/out/ \; || true
           cp -v $HOME/gki/common/out/Module.symvers /tmp/out/ 2>/dev/null || true
           cp -v $HOME/gki/common/out/include/config/kernel.release /tmp/out/ 2>/dev/null || true
+          cp -v /tmp/build.log /tmp/out/ 2>/dev/null || true
           ls -la /tmp/out
 
       - name: 上传产物
