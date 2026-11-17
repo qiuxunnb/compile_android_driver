@@ -1,0 +1,144 @@
+name: build-gpu-chams
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends \
+            git curl zip unzip bc bison flex libssl-dev libelf-dev \
+            python3 rsync cpio kmod \
+            clang lld llvm dwarves gcc-aarch64-linux-gnu || true
+          export PATH=/usr/local/bin:$PATH
+          if ! command -v ld.lld >/dev/null 2>&1; then
+            for c in /usr/bin/ld.lld-* /usr/lib/llvm-*/bin/ld.lld; do
+              [ -e "$c" ] && sudo ln -sf "$c" /usr/local/bin/ld.lld && break
+            done
+          fi
+          which ld.lld && ld.lld --version | head -1 || true
+          which clang  && clang --version | head -2  || true
+
+      - name: 定位源码并自动打补丁
+        run: |
+          F=$(find . -maxdepth 2 -name 'gpu_chams.c' -not -path './.git/*' | head -1)
+          if [ -z "$F" ]; then echo "!! 找不到 gpu_chams.c"; exit 1; fi
+          echo "源码: $F"
+          D=$(dirname "$F")
+          echo "SRC_DIR=$GITHUB_WORKSPACE/${D#./}" >> $GITHUB_ENV
+          ls -la "$D"
+          sed -i 's|#include <linux/ktime.h>|#include <linux/string.h>\n#include <linux/errno.h>|' "$F"
+          sed -i 's/probe_kernel_read/copy_from_kernel_nofault/g' "$F"
+          sed -i '/kgsl_mem_entry_placeholder/d' "$F"
+          echo "=== 补丁后检查 ==="
+          grep -n 'linux/string.h\|copy_from_kernel_nofault' "$F" || true
+
+      - name: 安装 repo 工具
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo || \
+          wget -qO ~/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+          git config --global user.name ci
+          git config --global user.email ci@ci
+
+      - name: 同步 GKI 内核源码（浅克隆）
+        run: |
+          export PATH=$HOME/bin:$PATH
+          mkdir -p ~/gki && cd ~/gki
+          repo init -u https://android.googlesource.com/kernel/manifest \
+                    -b common-android15-6.6 --depth 1
+          repo sync -j4 --no-tags --optimize 2>/dev/null || repo sync -j2
+          cd ~/gki/common && grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile
+
+      - name: 切到 6.6.89（浅拉单个 tag，最长 10 分钟）
+        run: |
+          cd ~/gki/common
+          echo "=== 当前版本 ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile
+          echo "=== 远端 6.6.89 tag（ls-remote，几秒出）==="
+          TAGS=$(timeout 180 git ls-remote --tags origin 2>/dev/null | grep -E '6\.6\.89' | awk '{print $2}' | sed 's|refs/tags/||' | grep -v '\^{}' | sort -V || true)
+          echo "$TAGS" | head -20
+          TAG=$(echo "$TAGS" | tail -1)
+          echo "选中 TAG=[$TAG]"
+          if [ -n "$TAG" ]; then
+            timeout 900 git fetch --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG" || \
+            timeout 900 git fetch --depth=1 origin tag "$TAG" || true
+            git checkout -f "$TAG" || true
+          else
+            echo "!! 没有 6.6.89 tag，保持当前版本（后面靠改 vermagic 兜底）"
+          fi
+          echo "=== 切换后版本 ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile
+
+      - name: 生成 defconfig
+        run: |
+          cd ~/gki/common
+          export PATH=/usr/local/bin:$PATH ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          if [ -f arch/arm64/configs/gki_defconfig ]; then
+            make -j$(nproc) O=out CC=clang HOSTCC=clang HOSTCXX=clang++ LD=ld gki_defconfig
+          else
+            make -j$(nproc) O=out CC=clang HOSTCC=clang HOSTCXX=clang++ LD=ld defconfig
+          fi
+          grep -E 'CONFIG_LOCALVERSION=|CONFIG_MODVERSIONS|CONFIG_MODULES=' out/.config | head
+
+      - name: 编译内核（生成 Module.symvers）
+        run: |
+          cd ~/gki/common
+          export PATH=/usr/local/bin:$PATH ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          if ! command -v pahole >/dev/null 2>&1; then
+            ./scripts/config --file out/.config -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES || true
+          fi
+          make -j$(nproc) O=out CC=clang LLVM=1 \
+               LD=ld.lld AR=llvm-ar NM=llvm-nm \
+               OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               HOSTCC=clang HOSTCXX=clang++ 2>&1 | tail -40
+          echo "=== 内核 release ==="
+          make -s O=out kernelrelease 2>/dev/null || cat out/include/config/kernel.release
+          ls -l out/Module.symvers || echo "没有 Module.symvers"
+
+      - name: 编译 gpu_chams
+        run: |
+          echo "源码目录: $SRC_DIR"
+          cd "$SRC_DIR"
+          export PATH=/usr/local/bin:$PATH
+          cat Makefile
+          make -C $HOME/gki/common O=$HOME/gki/common/out M=$PWD \
+               ARCH=arm64 CC=clang LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- \
+               KCFLAGS="-Wno-error" \
+               modules 2>&1 | tee /tmp/build.log | tail -60
+          echo "=== 产物 ==="
+          ls -l *.ko 2>/dev/null || echo "!! 没编出 ko"
+          echo "=== 错误摘要 ==="
+          grep -iE 'error' /tmp/build.log | head -20 || true
+
+      - name: 收集产物
+        if: always()
+        run: |
+          mkdir -p /tmp/out
+          find $GITHUB_WORKSPACE -name '*.ko' -not -path '*/.git/*' -exec cp -v {} /tmp/out/ \; || true
+          cp -v $HOME/gki/common/out/Module.symvers /tmp/out/ 2>/dev/null || true
+          cp -v $HOME/gki/common/out/include/config/kernel.release /tmp/out/ 2>/dev/null || true
+          cp -v /tmp/build.log /tmp/out/ 2>/dev/null || true
+          ls -la /tmp/out
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu_chams-ko
+          path: /tmp/out/
+          if-no-files-found: warn
+          retention-days: 14
