@@ -1,0 +1,17 @@
+# ABI 符号清单 —— 故意留空（只有注释）
+#
+# 原因：kade 的 abi patch 会「修改它自己构建的那个内核」的导出表。
+# 而手机上了运行的还是原厂内核 —— 你在编译期 patch 出来的导出，
+# 设备上并不存在，模块加载立刻报 unknown symbol。
+#
+# 我们这套代码的设计是「零未导出符号依赖」：
+#   · kallsyms_lookup_name   -> 用 register_kprobe 现场偷地址，无需导出
+#   · register_kprobe        -> 内核已 EXPORT_SYMBOL_GPL，GPL 模块可用
+#   · probe_kernel_read      -> 同上，已导出
+#   · kvmalloc / kvfree / copy_from_user / misc_register -> 全部已导出
+#
+# 所以这里什么都不要写。
+
+# register_kprobe
+# unregister_kprobe
+# kallsyms_lookup_name

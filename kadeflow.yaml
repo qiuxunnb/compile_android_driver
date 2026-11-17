@@ -1,0 +1,28 @@
+# ============================================================
+#  kade 配置 —— 三角洲 gpu_chams（android15 / kernel 6.6 / aarch64）
+#  放进你 fork 的 compile_android_driver 仓库根目录，覆盖原文件
+# ============================================================
+kade:
+  config_overrides:
+    kernel:
+      flavor: "gki"
+
+    gki:
+      android_version: 15
+      kernel_version: "6.6"
+      target_arch: "aarch64"
+
+      driver:
+        project_name: "gpu_chams"
+        in_tree: false
+        external_src_dir: "${GITHUB_WORKSPACE}/code"
+        module_name: "gpu_chams.ko"
+        overwrite: true
+
+# 重要：不要 patch ABI、不要额外导出符号。
+# 我们的模块只用「内核本来就已经导出」的符号（register_kprobe / probe_kernel_read /
+# kvmalloc 等），kallsyms_lookup_name 是通过 kprobe 现场偷地址，不需要导出。
+# 一旦乱 patch ABI，编出来的 ko 在设备上会报 unknown symbol。
+abi:
+  upstream_patch: false
+  symbols_file: "${GITHUB_WORKSPACE}/abi.symbols"
