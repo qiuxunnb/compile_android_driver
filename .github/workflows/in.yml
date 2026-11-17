@@ -27,8 +27,8 @@ jobs:
               [ -e "$c" ] && sudo ln -sf "$c" /usr/local/bin/ld.lld && break
             done
           fi
-          which ld.lld && ld.lld --version | head -1 || echo "no ld.lld"
-          which clang  && clang --version | head -2  || echo "no clang"
+          which ld.lld && ld.lld --version | head -1 || true
+          which clang  && clang --version | head -2  || true
 
       - name: 定位源码并自动打补丁
         run: |
@@ -38,18 +38,11 @@ jobs:
           D=$(dirname "$F")
           echo "SRC_DIR=$GITHUB_WORKSPACE/${D#./}" >> $GITHUB_ENV
           ls -la "$D"
-
-          echo "=== 补丁 1：补 string.h / errno.h ==="
           sed -i 's|#include <linux/ktime.h>|#include <linux/string.h>\n#include <linux/errno.h>|' "$F"
-          grep -n 'linux/string.h\|linux/errno.h' "$F" || true
-
-          echo "=== 补丁 2：probe_kernel_read -> copy_from_kernel_nofault ==="
           sed -i 's/probe_kernel_read/copy_from_kernel_nofault/g' "$F"
-          grep -n 'copy_from_kernel_nofault' "$F" || true
-
-          echo "=== 补丁 3：删掉无用的前向声明 ==="
           sed -i '/kgsl_mem_entry_placeholder/d' "$F"
-          grep -c 'kgsl_mem_entry_placeholder' "$F" || true
+          echo "=== 补丁后检查 ==="
+          grep -n 'linux/string.h\|copy_from_kernel_nofault' "$F" || true
 
       - name: 安装 repo 工具
         run: |
@@ -61,31 +54,31 @@ jobs:
           git config --global user.name ci
           git config --global user.email ci@ci
 
-      - name: 同步 GKI 内核源码
+      - name: 同步 GKI 内核源码（浅克隆）
         run: |
           export PATH=$HOME/bin:$PATH
           mkdir -p ~/gki && cd ~/gki
           repo init -u https://android.googlesource.com/kernel/manifest \
                     -b common-android15-6.6 --depth 1
           repo sync -j4 --no-tags --optimize 2>/dev/null || repo sync -j2
-          cd ~/gki/common && head -5 Makefile
+          cd ~/gki/common && grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile
 
-      - name: 切到 6.6.89（匹配设备的 GKI 小版本）
+      - name: 切到 6.6.89（浅拉单个 tag，最长 10 分钟）
         run: |
           cd ~/gki/common
           echo "=== 当前版本 ==="
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile
-          git fetch --unshallow 2>/dev/null || git fetch --depth=5000 origin 2>/dev/null || true
-          echo "=== 含 6.6.89 的 tag ==="
-          git tag -l | grep -E '6\.6\.89' | sort -V | head -20
-          TAG=$(git tag -l | grep -E '6\.6\.89' | sort -V | tail -1)
+          echo "=== 远端 6.6.89 tag（ls-remote，几秒出）==="
+          TAGS=$(timeout 180 git ls-remote --tags origin 2>/dev/null | grep -E '6\.6\.89' | awk '{print $2}' | sed 's|refs/tags/||' | grep -v '\^{}' | sort -V || true)
+          echo "$TAGS" | head -20
+          TAG=$(echo "$TAGS" | tail -1)
+          echo "选中 TAG=[$TAG]"
           if [ -n "$TAG" ]; then
-            echo "checkout $TAG"
-            git checkout -f "$TAG"
+            timeout 900 git fetch --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG" || \
+            timeout 900 git fetch --depth=1 origin tag "$TAG" || true
+            git checkout -f "$TAG" || true
           else
-            echo "!! 没找到 6.6.89 tag，尝试按 SUBLEVEL 反查 commit"
-            git log --all --oneline -- Makefile | head -3
-            echo "（继续用当前版本，靠后面改 vermagic 兜底）"
+            echo "!! 没有 6.6.89 tag，保持当前版本（后面靠改 vermagic 兜底）"
           fi
           echo "=== 切换后版本 ==="
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile
@@ -116,21 +109,20 @@ jobs:
           make -s O=out kernelrelease 2>/dev/null || cat out/include/config/kernel.release
           ls -l out/Module.symvers || echo "没有 Module.symvers"
 
-      - name: 编译 gpu_chams（打补丁后）
+      - name: 编译 gpu_chams
         run: |
           echo "源码目录: $SRC_DIR"
           cd "$SRC_DIR"
           export PATH=/usr/local/bin:$PATH
           cat Makefile
-          echo "=== 开始编译 ==="
           make -C $HOME/gki/common O=$HOME/gki/common/out M=$PWD \
                ARCH=arm64 CC=clang LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- \
                KCFLAGS="-Wno-error" \
                modules 2>&1 | tee /tmp/build.log | tail -60
           echo "=== 产物 ==="
-          ls -l *.ko 2>/dev/null || echo "!! 没编出 ko（看上面的 /tmp/build.log）"
+          ls -l *.ko 2>/dev/null || echo "!! 没编出 ko"
           echo "=== 错误摘要 ==="
-          grep -iE 'error|错误' /tmp/build.log | head -20 || true
+          grep -iE 'error' /tmp/build.log | head -20 || true
 
       - name: 收集产物
         if: always()
